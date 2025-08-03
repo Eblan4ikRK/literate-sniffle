@@ -8,74 +8,112 @@ interface RedisConfig {
   useTLS?: boolean;
 }
 
-let currentRedis: Redis | null = null;
-let currentConfig: RedisConfig | null = null;
+let client: Redis | null = null;
+let config: RedisConfig | null = null;
+let currentIndex = -1;
 
-// Функция для подключения к Redis (с failover)
-async function connectToRedis(): Promise<Redis | null> {
-  // Пробуем каждый Redis по порядку
-  for (const config of redisConfig as RedisConfig[]) {
-    try {
-      console.log(`🔧 Попытка подключиться к Redis: ${config.name} (${config.url.split('@').pop()})`);
+// Функция: подключиться к следующему доступному Redis
+async function connect(): Promise<boolean> {
+  // Начинаем с 0 или после текущего
+  const startFrom = currentIndex === -1 ? 0 : (currentIndex + 1) % redisConfig.length;
+  const tried: number[] = [];
 
-      const redis = new Redis(config.url, {
-        ...(config.useTLS ? { tls: {} } : {}),
-        retryStrategy: (times) => {
-          // Не пытаемся бесконечно — только при старте
-          if (times > 3) return null;
-          return Math.min(times * 100, 1000);
-        },
-        maxRetriesPerRequest: 1,
-      });
+  let index = startFrom;
 
-      await Promise.race([
-        redis.ping(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
-      ]);
-
-      console.log(`✅ Подключено к Redis: ${config.name}`);
-      currentConfig = config;
-      return redis;
-    } catch (error) {
-      console.warn(`❌ Не удалось подключиться к Redis ${config.name}:`, (error as Error).message);
+  do {
+    const conf = (redisConfig as RedisConfig[])[index];
+    if (!conf) {
+      tried.push(index);
       continue;
     }
-  }
 
-  console.error('🚨 Все Redis-серверы недоступны. Работаем в оффлайн-режиме.');
-  return null;
+    console.log(`🔁 Попытка подключиться к Redis: ${conf.name}`);
+
+    try {
+      const redis = new Redis(conf.url, {
+        ...(conf.useTLS ? { tls: {} } : {}),
+        maxRetriesPerRequest: 1,
+        retryStrategy: (times) => {
+          return times > 3 ? null : 100;
+        },
+      });
+
+      // Проверим подключение
+      await Promise.race([redis.ping(), new Promise((_, reject) => setTimeout(reject, 3000))]);
+
+      // Успешно
+      if (client) client.quit(); // Закрываем старое подключение
+      client = redis;
+      config = conf;
+      currentIndex = index;
+
+      console.log(`✅ Подключено к Redis: ${conf.name}`);
+      return true;
+    } catch (err) {
+      console.warn(`❌ Не удалось подключиться к Redis ${conf.name}:`, (err as Error).message);
+    }
+
+    tried.push(index);
+    index = (index + 1) % redisConfig.length;
+  } while (index !== startFrom);
+
+  console.error('🚨 Все Redis-серверы недоступны.');
+  client = null;
+  config = null;
+  currentIndex = -1;
+  return false;
 }
 
-// Инициализация подключения
-async function initRedis() {
-  if (currentRedis) return;
-
-  currentRedis = await connectToRedis();
-
-  // При ошибке одного — попробуем переключиться позже
-  if (currentRedis) {
-    currentRedis.on('error', async (err) => {
-      console.error('🔥 Критическая ошибка Redis:', err);
-      currentRedis?.disconnect();
-      currentRedis = null;
-      currentConfig = null;
-
-      // Через 5 сек попробуем переподключиться
-      setTimeout(async () => {
-        const newRedis = await connectToRedis();
-        if (newRedis) {
-          currentRedis = newRedis;
-          console.log('🔁 Переключились на новый Redis-инстанс');
-        }
-      }, 5000);
-    });
+// Инициализация
+async function init() {
+  if (!(await connect())) {
+    // Даже если не подключились — попробуем позже
+    setInterval(async () => {
+      if (!client) {
+        console.log('🔄 Попытка восстановить подключение к Redis...');
+        await connect();
+      }
+    }, 5000);
   }
 }
 
-// Вызываем при старте
-initRedis().catch(console.error);
+// Запускаем при старте
+init().catch(console.error);
 
-// Интерфейс хранилища
+// Обработка ошибок активного клиента
+function setupClientEvents() {
+  if (!client || !config) return;
+
+  client.on('error', async (err) => {
+    console.error(`🔥 Ошибка Redis (${config.name}):`, err.message);
+    client?.removeAllListeners();
+    client = null;
+
+    // Попробуем переключиться на другой узел
+    await connect();
+  });
+
+  client.on('close', () => {
+    console.log(`🔌 Соединение с Redis ${config?.name} закрыто`);
+    client = null;
+    setTimeout(() => connect(), 2000);
+  });
+}
+
+// Первое подключение + подписка на события
+connect().then(setupClientEvents);
+
+// Переподписываем события при каждом новом подключении
+const originalConnect = connect;
+connect = new Proxy(originalConnect, {
+  async apply(target, thisArg, args) {
+    const result = await Reflect.apply(target, thisArg, args);
+    if (result) setupClientEvents();
+    return result;
+  },
+});
+
+// === Интерфейс StatsStore ===
 export interface StatsStore {
   logRequest(): Promise<void>;
   getStats(): Promise<{
@@ -89,8 +127,8 @@ class FailoverStatsStore implements StatsStore {
   private readonly WINDOW_SIZE = 1000;
 
   async logRequest(): Promise<void> {
-    if (!currentRedis) {
-      console.debug('⚠️ Redis недоступен, logRequest проигнорирован');
+    if (!client) {
+      console.debug('⚠️ Redis недоступен. Запрос не залогирован.');
       return;
     }
 
@@ -98,11 +136,11 @@ class FailoverStatsStore implements StatsStore {
     const member = `${now}-${Math.random()}`;
 
     try {
-      await currentRedis.zadd(this.KEY, now, member);
-      await currentRedis.expire(this.KEY, 10);
-    } catch (error) {
-      console.error('❌ Ошибка при логировании запроса:', (error as Error).message);
-      // Не падаем — пусть retry или failover сработает позже
+      await client.zadd(this.KEY, now, member);
+      await client.expire(this.KEY, 10);
+    } catch (err) {
+      console.error('❌ Ошибка при logRequest:', (err as Error).message);
+      // Клиент сам упадёт → сработает переподключение
     }
   }
 
@@ -110,27 +148,26 @@ class FailoverStatsStore implements StatsStore {
     totalRequests: number;
     requestsPerSecond: number;
   }> {
-    if (!currentRedis) {
-      console.debug('⚠️ Redis недоступен, возвращаем 0');
+    if (!client) {
       return { totalRequests: 0, requestsPerSecond: 0 };
     }
 
     try {
       const now = Date.now();
       const cutoff = now - this.WINDOW_SIZE;
-      await currentRedis.zremrangebyscore(this.KEY, 0, cutoff);
-      const count = (await currentRedis.zcard(this.KEY)) || 0;
+      await client.zremrangebyscore(this.KEY, 0, cutoff);
+      const count = (await client.zcard(this.KEY)) || 0;
 
       return {
         totalRequests: count,
         requestsPerSecond: count,
       };
-    } catch (error) {
-      console.error('❌ Ошибка при получении статистики:', (error as Error).message);
+    } catch (err) {
+      console.error('❌ Ошибка при getStats:', (err as Error).message);
       return { totalRequests: 0, requestsPerSecond: 0 };
     }
   }
 }
 
-const statsStore: StatsStore = new FailoverStatsStore();
+const statsStore = new FailoverStatsStore();
 export default statsStore;
