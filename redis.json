@@ -1,0 +1,12 @@
+[
+    {
+      "url": "redis://default:3IWT7AMEmKHQwdnNUJoHO2EDtP0EPPtQ@redis-11732.c74.us-east-1-4.ec2.redns.redis-cloud.com:11732",
+      "name": "primary",
+      "useTLS": false
+    },
+    {
+      "url": "redis://default:1ZtBqzg9jX5MchBgkwutOryfymcN1Kb3@redis-12856.c300.eu-central-1-1.ec2.redns.redis-cloud.com:12856",
+      "name": "backup",
+      "useTLS": false
+    }
+  ]
